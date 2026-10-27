@@ -8,7 +8,8 @@ pydantic
 pytest
 httpx
 lightgbm
+mlflow>=3.17.2
 joblib
-scikit-learn
+scikit-learn==1.7.2
 pandera
 mkdocs

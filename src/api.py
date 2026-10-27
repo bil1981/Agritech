@@ -1,312 +1,500 @@
+# -*- coding: utf-8 -*-
+"""
+API FastAPI - Agritech Answers
+
+Endpoints :
+- GET  /health : verification de disponibilite
+- GET  /crops  : liste des cultures disponibles
+- POST /predict : prediction du rendement pour une culture donnee
+- POST /recommend : classement des cultures pour une parcelle
+
+La base SQLite agritech.db est utilisee pour :
+- enregistrer les conditions de parcelle ;
+- stocker les predictions ;
+- conserver le classement des cultures recommandees.
+
+Artefacts attendus :
+- models/best_yield_model.joblib
+- models/best_model_metadata.json
+- agritech.db
+"""
+
+import json
+import math
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from time import perf_counter
-from typing import Any, Dict
+from typing import Any
 
-import lightgbm as lgb
+import joblib
 import pandas as pd
+import sklearn
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
-
-from validation.schemas import validate_credit_data
-
-
-# ============================================================
-# CHEMINS
-# ============================================================
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ARTIFACT_DIRECTORIES = (
+    PROJECT_ROOT / "models",
+    PROJECT_ROOT / "notebooks" / "models",
+)
+DATABASE_PATH = PROJECT_ROOT / "agritech.db"
 
-MODEL_PATH = PROJECT_ROOT / "models" / "lightgbm_model.txt"
+TARGET = "yield_t_ha"
+MODEL_VERSION = "v1"
 
-LOG_DIR = PROJECT_ROOT / "logs"
-PRODUCTION_LOG_PATH = LOG_DIR / "production_data.csv"
+REQUIRED_PARCEL_FEATURES = (
+    "country",
+    "year",
+    "rainfall_mm",
+    "avg_temp_c",
+    "pesticides_tonnes",
+)
 
-DECISION_THRESHOLD = 0.30
-
-
-# ============================================================
-# MODELES PYDANTIC
-# ============================================================
-
-
-class PredictionRequest(BaseModel):
-    SK_ID_CURR: int
-    features: Dict[str, Any] = Field(default_factory=dict)
-
-
-class PredictionResponse(BaseModel):
-    SK_ID_CURR: int
-    probability: float
-    decision: str
+CATEGORICAL_FEATURES = {"country", "crop"}
 
 
-# ============================================================
-# LOGGING CSV
-# ============================================================
+# ----------------------------------------------------------------------
+# Modeles Pydantic
+# ----------------------------------------------------------------------
 
 
-def log_prediction(
-    payload: PredictionRequest,
-    probability: float,
-    decision: str,
-    latency_ms: float,
-    status: int = 200,
-) -> None:
-    """
-    Ajoute une prédiction dans production_data.csv.
-    Le logging ne doit jamais bloquer la prédiction.
-    """
+class YieldRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
+    country: str = Field(description="Pays de la parcelle.")
+    year: int = Field(ge=1900, le=2100, description="Annee de culture.")
+    rainfall_mm: float = Field(
+        ge=0, allow_inf_nan=False, description="Pluviometrie annuelle en mm."
+    )
+    avg_temp_c: float = Field(
+        allow_inf_nan=False, description="Temperature moyenne en degres Celsius."
+    )
+    pesticides_tonnes: float = Field(
+        ge=0, allow_inf_nan=False, description="Pesticides utilises en tonnes."
+    )
+    crop: str | None = Field(
+        default=None,
+        description="Culture a evaluer. Obligatoire pour /predict, interdit pour /recommend.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def unwrap_features(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "features" in value:
+            if len(value) != 1:
+                raise ValueError(
+                    "Fournissez soit les champs de parcelle à la racine, "
+                    "soit un objet 'features', mais pas les deux."
+                )
+            features = value["features"]
+            if not isinstance(features, dict):
+                raise ValueError("'features' doit être un objet JSON.")
+            return features
+        return value
+
+    @model_validator(mode="after")
+    def normalize_text_fields(self) -> "YieldRequest":
+        self.country = self.country.strip()
+        if not self.country:
+            raise ValueError("'country' ne peut pas être vide.")
+        if self.crop is not None:
+            self.crop = self.crop.strip()
+        return self
+
+
+class YieldPredictionResponse(BaseModel):
+    parcel_id: int
+    crop: str
+    estimated_yield_t_ha: float
+    model_version: str
+
+
+class CropRecommendation(BaseModel):
+    rank: int
+    crop: str
+    estimated_yield_t_ha: float
+    recommended: bool
+
+
+class RecommendationResponse(BaseModel):
+    parcel_id: int
+    recommendations: list[CropRecommendation]
+
+
+class CropListResponse(BaseModel):
+    crops: list[str]
+
+
+# ----------------------------------------------------------------------
+# Chargement des artefacts
+# ----------------------------------------------------------------------
+
+
+def _load_artifacts() -> tuple[Any, dict[str, Any]]:
+    for artifact_directory in ARTIFACT_DIRECTORIES:
+        metadata_path = artifact_directory / "best_model_metadata.json"
+        model_path = artifact_directory / "best_yield_model.joblib"
+
+        if metadata_path.is_file() and model_path.is_file():
+            with metadata_path.open(encoding="utf-8") as metadata_file:
+                metadata = json.load(metadata_file)
+
+            expected_version = metadata.get("sklearn_version")
+            current_version = sklearn.__version__
+
+            if expected_version and expected_version != current_version:
+                raise RuntimeError(
+                    "Version scikit-learn incompatible. "
+                    f"Modele entraîne avec {expected_version}, "
+                    f"environnement actuel : {current_version}."
+                )
+
+            model = joblib.load(model_path)
+            return model, metadata
+
+    expected_paths = [
+        str(directory / filename)
+        for directory in ARTIFACT_DIRECTORIES
+        for filename in ("best_model_metadata.json", "best_yield_model.joblib")
+    ]
+    raise RuntimeError(
+        "Artefacts du modele Agritech introuvables. "
+        f"Attendu dans : {', '.join(str(d) for d in ARTIFACT_DIRECTORIES)}. "
+        f"Fichiers recherches : {', '.join(expected_paths)}"
+    )
+
+
+def _get_crop_options(model: Any) -> list[str]:
     try:
-        LOG_DIR.mkdir(
-            parents=True,
-            exist_ok=True,
+        preprocessor = model.named_steps["preprocessor"]
+        categorical_columns = next(
+            columns for name, _, columns in preprocessor.transformers_ if name == "cat"
         )
+        crop_index = categorical_columns.index("crop")
+        categorical_transformer = preprocessor.named_transformers_["cat"]
+        one_hot_encoder = categorical_transformer.named_steps["onehot"]
+        return [str(crop) for crop in one_hot_encoder.categories_[crop_index]]
+    except (AttributeError, KeyError, StopIteration, ValueError, IndexError) as error:
+        raise RuntimeError(
+            "Impossible de determiner les cultures a partir du pipeline entraîne."
+        ) from error
 
-        # ----------------------------------------------------
-        # Construire la ligne
-        # ----------------------------------------------------
 
-        log_row = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "SK_ID_CURR": "999999999",
-            **payload.features,
-            "probability": probability,
-            "decision": decision,
-            "latency_ms": round(latency_ms, 2),
-            "status": status,
+# ----------------------------------------------------------------------
+# Acces SQLite
+# ----------------------------------------------------------------------
+
+
+def _get_connection() -> sqlite3.Connection:
+    if not DATABASE_PATH.is_file():
+        raise RuntimeError(
+            f"Base SQLite introuvable : {DATABASE_PATH}. "
+            "Executez d'abord build_agritech_database.py."
+        )
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _insert_parcel(conn: sqlite3.Connection, payload: YieldRequest) -> int:
+    created_at = datetime.now(timezone.utc).isoformat()
+    cursor = conn.execute(
+        """
+        INSERT INTO parcel_conditions (
+            country, year, rainfall_mm, avg_temp_c,
+            pesticides_tonnes, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.country.strip(),
+            payload.year,
+            payload.rainfall_mm,
+            payload.avg_temp_c,
+            payload.pesticides_tonnes,
+            created_at,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _get_crop_reference(conn: sqlite3.Connection, crop: str) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT crop, crop_irrigation_rate, crop_fertilizer_rate,
+               crop_mean_days_to_harvest, crop_mean_rainfall_local_mm,
+               crop_mean_temperature_local_c, has_agronomic_proxy
+        FROM crop_reference
+        WHERE crop = ?
+        """,
+        (crop,),
+    ).fetchone()
+
+    if row is None:
+        return {
+            "crop": crop,
+            "crop_irrigation_rate": None,
+            "crop_fertilizer_rate": None,
+            "crop_mean_days_to_harvest": None,
+            "crop_mean_rainfall_local_mm": None,
+            "crop_mean_temperature_local_c": None,
+            "has_agronomic_proxy": 0,
         }
 
-        new_row = pd.DataFrame([log_row])
+    return dict(row)
 
-        # ----------------------------------------------------
-        # CAS 1 :
-        # fichier inexistant OU fichier vide
-        # ----------------------------------------------------
 
-        if not PRODUCTION_LOG_PATH.exists() or PRODUCTION_LOG_PATH.stat().st_size == 0:
-            new_row.to_csv(
-                PRODUCTION_LOG_PATH,
-                index=False,
-            )
+def _build_model_input(
+    payload: YieldRequest,
+    feature_names: list[str],
+    crop: str,
+    crop_reference: dict[str, Any],
+) -> pd.DataFrame:
+    row: dict[str, Any] = {}
 
-            print(f"Production log créé : {PRODUCTION_LOG_PATH}")
+    for feature in feature_names:
+        if feature == "country":
+            row[feature] = payload.country.strip()
+        elif feature == "year":
+            row[feature] = payload.year
+        elif feature == "rainfall_mm":
+            row[feature] = payload.rainfall_mm
+        elif feature == "avg_temp_c":
+            row[feature] = payload.avg_temp_c
+        elif feature == "pesticides_tonnes":
+            row[feature] = payload.pesticides_tonnes
+        elif feature == "crop":
+            row[feature] = crop
+        else:
+            row[feature] = crop_reference.get(feature)
 
-            return
+    return pd.DataFrame([row], columns=feature_names)
 
-        # ----------------------------------------------------
-        # CAS 2 :
-        # fichier déjà alimenté
-        # ----------------------------------------------------
 
-        existing_columns = pd.read_csv(
-            PRODUCTION_LOG_PATH,
-            nrows=0,
-        ).columns.tolist()
+def _predict_crop(
+    model: Any,
+    payload: YieldRequest,
+    feature_names: list[str],
+    crop: str,
+    conn: sqlite3.Connection,
+) -> float:
+    crop_reference = _get_crop_reference(conn, crop)
+    model_input = _build_model_input(payload, feature_names, crop, crop_reference)
 
-        # Respecter les colonnes existantes
-        new_row = new_row.reindex(
-            columns=existing_columns,
+    try:
+        estimate = float(model.predict(model_input)[0])
+    except (TypeError, ValueError, KeyError) as error:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Impossible de calculer le rendement pour {crop!r} : {error}",
+        ) from error
+
+    if not math.isfinite(estimate):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Le modele a retourne une estimation non finie pour {crop!r}.",
         )
 
-        new_row.to_csv(
-            PRODUCTION_LOG_PATH,
-            mode="a",
-            header=False,
-            index=False,
-        )
-
-    except Exception as error:
-        # IMPORTANT :
-        # une erreur de logging ne doit jamais
-        # provoquer une erreur FastAPI 500
-
-        print(f"Erreur logging CSV : {error}")
+    return estimate
 
 
-# ============================================================
-# LIFESPAN
-# ============================================================
+# ----------------------------------------------------------------------
+# Cycle de vie de l'application
+# ----------------------------------------------------------------------
 
 
-@asynccontextmanager  # il sert à gérer le cycle de vie de l'application FastAPI
+@asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not MODEL_PATH.exists():
-        raise RuntimeError(f"Modèle introuvable : {MODEL_PATH}")
+    model, metadata = _load_artifacts()
 
-    # Charger le modèle LightGBM
-    app.state.model = lgb.Booster(model_file=str(MODEL_PATH))
+    feature_names = metadata.get("features")
+    if not isinstance(feature_names, list) or not feature_names:
+        raise RuntimeError("Les metadonnees du modele ne contiennent pas 'features'.")
 
-    # Utiliser les noms des variables réellement enregistrés dans le modèle
-    app.state.feature_names = list(app.state.model.feature_name())
+    if metadata.get("target") != TARGET:
+        raise RuntimeError(
+            f"Cible incompatible dans les metadonnees : "
+            f"{metadata.get('target')!r}, attendu {TARGET!r}."
+        )
 
-    print(f" {len(app.state.feature_names)} variables chargées depuis LightGBM")
+    if (
+        not hasattr(model, "feature_names_in_")
+        or list(model.feature_names_in_) != feature_names
+    ):
+        raise RuntimeError(
+            "Les variables du modele ne correspondent pas a celles des metadonnees."
+        )
 
-    print(f"Logging production : {PRODUCTION_LOG_PATH}")
+    app.state.model = model
+    app.state.feature_names = feature_names
+    app.state.crop_options = _get_crop_options(model)
+    app.state.model_version = metadata.get("model_version", MODEL_VERSION)
 
     yield
 
 
-# ============================================================
-# APPLICATION
-# ============================================================
-
 app = FastAPI(
-    title="Credit Risk API",
+    title="Agritech Yield API",
+    description=(
+        "Prediction du rendement agricole et recommandation de la culture "
+        "la plus performante pour une parcelle donnee."
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
 
 
-# ============================================================
-# PREDICTION
-# ============================================================
+# ----------------------------------------------------------------------
+# Endpoints
+# ----------------------------------------------------------------------
 
 
-@app.post(
-    "/predict",
-    response_model=PredictionResponse,
-)
-def predict(
-    payload: PredictionRequest,
-    request: Request,
-) -> PredictionResponse:
-    start_time = perf_counter()
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/crops", response_model=CropListResponse)
+def crops(request: Request) -> CropListResponse:
+    return CropListResponse(crops=request.app.state.crop_options)
+
+
+@app.post("/predict", response_model=YieldPredictionResponse)
+def predict(payload: YieldRequest, request: Request) -> YieldPredictionResponse:
+    if not payload.crop:
+        raise HTTPException(
+            status_code=422,
+            detail="La variable 'crop' est obligatoire pour /predict.",
+        )
+
+    crop = payload.crop.strip()
+    if crop not in request.app.state.crop_options:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Culture inconnue : {crop!r}. Cultures disponibles : "
+                f"{', '.join(request.app.state.crop_options)}"
+            ),
+        )
+
+    conn = _get_connection()
+    try:
+        model = request.app.state.model
+        feature_names = request.app.state.feature_names
+        estimate = _predict_crop(model, payload, feature_names, crop, conn)
+        parcel_id = _insert_parcel(conn, payload)
+        predicted_at = datetime.now(timezone.utc).isoformat()
+
+        conn.execute(
+            """
+            INSERT INTO yield_predictions (
+                parcel_id, crop, predicted_yield_t_ha,
+                model_version, predicted_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (parcel_id, crop, estimate, request.app.state.model_version, predicted_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return YieldPredictionResponse(
+        parcel_id=parcel_id,
+        crop=crop,
+        estimated_yield_t_ha=estimate,
+        model_version=request.app.state.model_version,
+    )
+
+
+@app.post("/recommend", response_model=RecommendationResponse)
+def recommend(payload: YieldRequest, request: Request) -> RecommendationResponse:
+    if payload.crop:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Ne fournissez pas 'crop' pour /recommend : "
+                "l'API evalue automatiquement toutes les cultures."
+            ),
+        )
 
     model = request.app.state.model
     feature_names = request.app.state.feature_names
+    created_at = datetime.now(timezone.utc).isoformat()
 
+    conn = _get_connection()
     try:
-        # ====================================================
-        # 1. DONNEES RECUES
-        # ====================================================
+        parcel_id = _insert_parcel(conn, payload)
 
-        df = pd.DataFrame([payload.features])
+        recommendations: list[CropRecommendation] = []
+        for crop in request.app.state.crop_options:
+            estimate = _predict_crop(model, payload, feature_names, crop, conn)
 
-        df["SK_ID_CURR"] = payload.SK_ID_CURR
-
-        try:
-            df = validate_credit_data(df)
-        except Exception as error:
-            raise HTTPException(
-                status_code=422,
-                detail=(f"Validation des données échouée : {error}"),
-            ) from error
-
-        raw_df = df
-
-        # ====================================================
-        # 2. SUPPRESSION TARGET / DECISION
-        # ====================================================
-
-        raw_df = raw_df.drop(
-            columns=[
-                "TARGET",
-                "DECISION",
-            ],
-            errors="ignore",
-        )
-
-        # ====================================================
-        # 3. VARIABLES CATEGORIELLES
-        # ====================================================
-
-        categorical_columns = raw_df.select_dtypes(
-            include=["object", "category"]
-        ).columns.tolist()
-
-        encoded_df = pd.get_dummies(
-            raw_df,
-            columns=categorical_columns,
-            dummy_na=False,
-        )
-
-        # ====================================================
-        # 4. ALIGNEMENT AVEC LIGHTGBM
-        # ====================================================
-
-        encoded_df = encoded_df.reindex(
-            columns=feature_names,
-            fill_value=0,
-        )
-
-        # ====================================================
-        # 5. CONVERSION NUMERIQUE
-        # ====================================================
-
-        encoded_df = encoded_df.apply(
-            pd.to_numeric,
-            errors="coerce",
-        ).fillna(0)
-
-        # ====================================================
-        # 6. VERIFICATION
-        # ====================================================
-
-        if encoded_df.shape[1] != model.num_feature():
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    f"Nombre de variables incorrect : "
-                    f"{encoded_df.shape[1]} reçues, "
-                    f"{model.num_feature()} attendues."
+            conn.execute(
+                """
+                INSERT INTO yield_predictions (
+                    parcel_id, crop, predicted_yield_t_ha,
+                    model_version, predicted_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    parcel_id,
+                    crop,
+                    estimate,
+                    request.app.state.model_version,
+                    created_at,
                 ),
             )
 
-        # ====================================================
-        # 7. PREDICTION
-        # ====================================================
+            recommendations.append(
+                CropRecommendation(
+                    rank=0,
+                    crop=crop,
+                    estimated_yield_t_ha=estimate,
+                    recommended=False,
+                )
+            )
 
-        probability = float(model.predict(encoded_df)[0])
-
-        decision = "REFUSED" if probability >= DECISION_THRESHOLD else "APPROVED"
-
-        # ====================================================
-        # 8. LATENCE
-        # ====================================================
-
-        latency_ms = (perf_counter() - start_time) * 1000
-
-        # ====================================================
-        # 9. LOG PRODUCTION
-        # ====================================================
-
-        log_prediction(
-            payload=payload,
-            probability=probability,
-            decision=decision,
-            latency_ms=latency_ms,
-            status=200,
+        recommendations.sort(
+            key=lambda recommendation: recommendation.estimated_yield_t_ha,
+            reverse=True,
         )
 
-        # ====================================================
-        # 10. REPONSE
-        # ====================================================
+        for rank, recommendation in enumerate(recommendations, start=1):
+            recommendation.rank = rank
+            recommendation.recommended = rank == 1
 
-        return PredictionResponse(
-            SK_ID_CURR=payload.SK_ID_CURR,
-            probability=probability,
-            decision=decision,
-        )
+            conn.execute(
+                """
+                INSERT INTO crop_recommendations (
+                    parcel_id, crop, predicted_yield_t_ha,
+                    rank, recommended, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    parcel_id,
+                    recommendation.crop,
+                    recommendation.estimated_yield_t_ha,
+                    rank,
+                    1 if recommendation.recommended else 0,
+                    created_at,
+                ),
+            )
 
-    except HTTPException:
-        raise
+        conn.commit()
+    finally:
+        conn.close()
 
-    except Exception as error:
-        latency_ms = (perf_counter() - start_time) * 1000
+    return RecommendationResponse(
+        parcel_id=parcel_id,
+        recommendations=recommendations,
+    )
 
-        # Logger l'erreur,
-        log_prediction(
-            payload=payload,
-            probability=None,
-            decision="ERROR",
-            latency_ms=latency_ms,
-            status=500,
-        )
 
-        raise HTTPException(
-            status_code=500,
-            detail=(f"Erreur lors de la prédiction : {error}"),
-        )
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

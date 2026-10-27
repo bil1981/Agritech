@@ -1,16 +1,32 @@
+name: Generate Changelog
 
+on:
+  push:
+    tags:
+      - 'v*'
 
-#Définit la liste des conteneurs à lancer. Ici, un seul service nommé app_complete
-services:
-  app_complete:
-    #Indique à Docker d'aller télécharger (pull) l'image construite et publiée par ton pipeline GitHub Actions (cd.yml) sur le registre GitHub Packages.
-    image: ghcr.io/bil1981/p1_code_python:latest
-    #Donne un nom fixe et lisible au conteneur local au lieu d'un nom aléatoire généré par Docker
-    container_name: mlops_app_container
-    ports:
-      - "8000:8000"   # Port de FastAPI
-      - "8501:8501"   # Port de Streamlit
-    #Mappe le dossier local ./data vers le dossier /app/data du conteneu
-    volumes:
-      - ./data:/app/data
-    restart: unless-stopped
+permissions:
+  contents: write
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate CHANGELOG.md with git-cliff
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: -o CHANGELOG.md
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Commit & Push CHANGELOG.md
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs: update CHANGELOG.md for ${{ github.ref_name }} [skip ci]"
+          file_pattern: "CHANGELOG.md"

@@ -1,12 +1,12 @@
-# Projet MLOps - Home Credit Default Risk
+# Projet MLOps - Agritech Answers
 
-Ce projet met en oeuvre un modèle LightGBM de prédiction du risque de défaut de paiement à partir des données Home Credit. Il comprend :
+Ce dépôt conserve un pipeline historique Home Credit et comprend désormais un prototype Agritech de prédiction de rendement agricole. L'application Agritech s'appuie sur un modèle scikit-learn, une API FastAPI et une interface Streamlit. Les principales composantes sont :
 
-- un pipeline de préparation et de feature engineering dans `notebooks/` ;
-- un modèle LightGBM sauvegardé dans `models/lightgbm_model.txt` ;
-- une base SQLite contenant les données clients, les prédictions et l'importance des variables ;
-- un dashboard Streamlit pour l'exploration des résultats ;
-- une API FastAPI pour exposer les prédictions ;
+- les scripts et notebooks d'entraînement dans `notebooks/` ;
+- le modèle de rendement et ses métadonnées dans `models/` ;
+- le script `src/build_agritech_database.py`, qui construit la base `agritech.db` ;
+- l'API FastAPI `src/api.py`, qui expose la prédiction et la recommandation ;
+- l'interface Streamlit `app.py`, qui utilise la base Agritech et l'API ;
 - une structure dédiée pour les tests et les workflows CI/CD.
 
 ## 1. Structure du projet
@@ -15,12 +15,14 @@ Ce projet met en oeuvre un modèle LightGBM de prédiction du risque de défaut 
 P1_Code_Python/
 ├── src/
 │   ├── api.py              # API FastAPI
-│   ├── build_database.py   # Construction de credit_risk.db depuis des CSV
+│   ├── build_agritech_database.py # Construction de agritech.db
 ├── models/
-│   └── lightgbm_model.txt
+│   └── best_yield_model.joblib
+│   └── best_model_metadata.json
 ├── notebooks/
-│   └── lightgbm_script.py
-├── src/                    # Données CSV et fichiers de résultats
+│   └── step1_eda_fusion_acp.ipynb
+│   └── step2_train_yield_model.ipynb
+├── data/                    # Données initiales CSV et fichiers de résultats
 ├── tests/                  # Tests automatisés API et tests unitaires/API (Pytest/Pandera)
 ├── .github/workflows/      # Workflows GitHub Actions, CI/CD yaml
 ├── monitoring/      		# rapports de dérive (Drif) Evidently AI
@@ -39,8 +41,8 @@ P1_Code_Python/
 ## 2. Prérequis
 
 - Windows avec Python 3.10 ou version supérieure ;
-- les données Home Credit dans `src/` ;
-- le modèle `models/lightgbm_model.txt` ;
+- les données agritech dans `data/raw` ;
+- le modèle `models/` ;
 - PowerShell ou un terminal VS Code.
 
 Les chemins utilisés par les scripts sont relatifs à la racine du projet. Toutes les commandes suivantes doivent donc être exécutées depuis `P1_Code_Python`.
@@ -66,191 +68,103 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Les dépendances principales sont `pandas`, `numpy`, `lightgbm`, `streamlit`, `plotly`, `fastapi`, `uvicorn`, `pydantic`, `pytest` et `httpx`.
+Les dépendances principales sont `pandas`, `numpy`, `lightgbm`, `mlflow`, `scikit-learn`, `streamlit`, `plotly`, `fastapi`, `uvicorn`, `pydantic`, `pytest` et `httpx`.
+
+### Notebook d'entraînement Agritech et suivi MLflow
+
+Le notebook `notebooks/step2_train_yield_model.ipynb` entraîne et compare les modèles de rendement. Il charge le jeu de données `data/processed/crop_yield_unified.parquet` et utilise MLflow pour enregistrer les expériences, métriques et modèles.
+
+Après l'installation des dépendances ci-dessus, sélectionnez le kernel Python de cet environnement dans VS Code et démarrez le serveur MLflow depuis la racine du projet :
+
+```powershell
+mlflow ui --host 127.0.0.1 --port 5000 --backend-store-uri sqlite:///mlflow.db
+```
+
+Laissez ce terminal ouvert, puis exécutez les cellules du notebook dans l'ordre. L'interface de suivi est disponible sur `http://127.0.0.1:5000`. Si MLflow n'est pas reconnu par le notebook, vérifiez que son kernel utilise bien l'environnement où `requirements.txt` a été installé, puis redémarrez le kernel.
 
 ## 4. Préparation des données et du modèle
 
 Le script de modélisation situé dans `notebooks/lightgbm_script.py` lit les fichiers suivants :
 
-- `Data/raw//application_train.csv` ;
-- `Data/raw/application_test.csv` ;
-- `Data/raw/bureau.csv` et `src/bureau_balance.csv` ;
-- `Data/raw/previous_application.csv` ;
-- `Data/raw/POS_CASH_balance.csv` ;
-- `Data/raw/installments_payments.csv` ;
-- `Data/raw/credit_card_balance.csv`.
+- `Data/raw/Agriculture_Crop_Yield/*.csv` ;
+- `Data/raw/Crop_Yield_Prediction_Dataset/*.csv`.
 
 Le pipeline effectue notamment le one-hot encoding, les agrégations par `SK_ID_CURR`, le feature engineering et l'entraînement LightGBM avec validation croisée. Le modèle final doit être disponible sous :
 
 ```text
-models/lightgbm_model.txt
+Artefacts attendus :
+- models/best_yield_model.joblib
+- models/best_model_metadata.json
 ```
 
 Les fichiers de prédictions et d'importance des variables utilisés par la base sont notamment :
 
-```fichier  csv de resultats Lightgbm
-input/submission_kernel02.csv
-input/feature_importance.csv
+```fichier parquet de resultats Forest random
+data/processed/crop_yield_unified.parquet
 ```
 
-## 5. Construction de la base SQLite
+## 5. Construction de la base Agritech
 
-Construire la base utilisée par le dashboard :
+Depuis la racine du projet, créer `agritech.db` :
 
 ```powershell
-python .\app\build_database.py
+python .\src\build_agritech_database.py
 ```
 
-Cette commande crée ou remplace `credit_risk.db` et génère principalement :
+Le script charge les données consolidées, le modèle et ses métadonnées. La base comprend notamment le référentiel des cultures (`crop_reference`), l'historique des rendements (`crop_yield_history`), les indicateurs du modèle (`model_metadata`) et les classements d'exemple. Le fichier est créé à la racine sous `agritech.db`.
 
-- `client_features` : données clients fusionnées avec les prédictions ;
-- `feature_importance` : importance moyenne des variables.
-
-
-## 6. Lancer le dashboard Streamlit
+## 6. Lancer l'API de rendement
 
 Depuis la racine du projet :
+
+```powershell
+python -m uvicorn src.api:app --reload
+```
+
+L'API est disponible à l'adresse `http://127.0.0.1:8000` et sa documentation interactive sur `http://127.0.0.1:8000/docs`.
+
+- `GET /health` vérifie que l'API répond.
+- `POST /predict` estime le rendement d'une culture fournie.
+- `POST /recommend` classe toutes les cultures pour les conditions fournies.
+
+Exemple de requête `/predict` :
+
+```json
+{
+  "features": {
+    "country": "France",
+    "year": 2013,
+    "crop": "Maize",
+    "rainfall_mm": 800,
+    "avg_temp_c": 12,
+    "pesticides_tonnes": 5000
+  }
+}
+```
+
+Exemple de requête `/recommend` : même objet `features`, sans la propriété `crop`.
+
+## 7. Lancer l'application Streamlit
+
+Générer d'abord la base, puis lancer l'API et, dans un second terminal, l'interface :
+
+```powershell
+python .\src\build_agritech_database.py
+python -m uvicorn src.api:app --reload
+```
 
 ```powershell
 streamlit run app.py
 ```
 
-Le dashboard permet de :
-
-- rechercher un client par `SK_ID_CURR` ;
-- consulter sa probabilité de défaut et sa décision ;
-- afficher et modifier des variables sélectionnées ;
-- consulter l'importance globale des variables.
-
-La règle métier utilisée dans l'interface est :
-
-- probabilité `< 0.30` : `APPROVED` ;
-- probabilité `>= 0.30` : `REFUSED`.
-
-## 7. Lancer l'API FastAPI
-
-Démarrer le serveur de développement :
-
-```powershell
-uvicorn app.main:app --reload
-```
-
-L'API est disponible à l'adresse `http://127.0.0.1:8000`.
-
-Documentation interactive :
-
-- Swagger UI : `http://127.0.0.1:8000/docs` ;
-- ReDoc : `http://127.0.0.1:8000/redoc`.
-
-Au démarrage, le cycle de vie FastAPI charge une seule fois le modèle LightGBM et la connexion SQLite. Ces ressources sont libérées à l'arrêt de l'application.
-
-### Vérifier l'état de l'API
-
-```powershell
-Invoke-RestMethod -Uri http://127.0.0.1:8000/health -Method Get
-```
-
-Réponse attendue :
-
-```json
-{"status":"ok"}
-```
-
-### Appeler `/predict`
-
-Le payload doit contenir `SK_ID_CURR` et un objet `features`. Les noms et valeurs doivent correspondre aux 238 features attendues par le modèle. Les features sont numériques, y compris les variables catégorielles déjà encodées et les colonnes issues du one-hot encoding.
-
-Exemple de structure :
-
-```json
-{
-	"SK_ID_CURR": 100001,
-	"features": {
-		"NAME_CONTRACT_TYPE": 0,
-		"FLAG_OWN_CAR": 1,
-		"AMT_INCOME_TOTAL": 180000.0,
-		"AMT_CREDIT": 500000.0,
-		"EXT_SOURCE_2": 0.65
-	}
-}
-```
-
-L'exemple ci-dessus est volontairement abrégé. Pour obtenir une prédiction, toutes les features attendues par le modèle doivent être fournies. Une feature manquante ou inconnue renvoie une erreur HTTP `422` avec le détail de validation.
-
-Exemple PowerShell avec un fichier JSON complet :
-
-```powershell
-Invoke-RestMethod `
-	-Uri http://127.0.0.1:8000/predict `
-	-Method Post `
-	-ContentType "application/json" `
-	-InFile .\payload.json
-```
-
-Réponse :
-
-```json
-{
-	"SK_ID_CURR": 100001,
-	"probability": 0.1446,
-	"decision": "REFUSED"
-}
-```
+L'interface utilise `agritech.db` pour proposer les pays et cultures, afficher les indicateurs du modèle et enrichir les prédictions avec les références agronomiques. Elle permet d'estimer un rendement ou d'obtenir le classement des cultures via l'API. Pour configurer les chemins, les variables d'environnement `AGRITECH_DB_PATH` et `API_URL` peuvent être définies.
 
 ## 8. Tests et validations
 
-Lancer les tests présents dans le projet :
+Lancer les tests ciblés de l'API et de Streamlit :
 
 ```powershell
-pytest
-```
-
-Les vérifications manuelles effectuées lors de la mise en place sont :
-
-```powershell
-python -m py_compile .\app\main.py
-python .\app\check_db.py
-```
-
-L'API a également été vérifiée avec `TestClient` pour les cas suivants :
-
-- `/health` renvoie `200` et `status: ok` lorsque le modèle est chargé ;
-- `/predict` renvoie une probabilité et une décision ;
-- un payload incomplet renvoie `422`.
-
-## 9. Déroulement de la mise en place
-
-1. Création ou vérification des répertoires `app/`, `tests/`, `.github/` et `.github/workflows/`.
-2. Création de `requirements.txt` avec les dépendances data science, Streamlit, API et tests.
-3. Identification du modèle LightGBM existant et de ses features attendues.
-4. Création de `app/main.py` avec les schémas Pydantic.
-5. Ajout du gestionnaire `lifespan` pour charger le modèle et SQLite au démarrage.
-6. Ajout des routes `/health` et `/predict`.
-7. Validation des features manquantes et inconnues avant prédiction.
-8. Ajout de `lightgbm` aux dépendances pour rendre le déploiement reproductible.
-9. Compilation et tests fonctionnels de l'API.
-10. Documentation de l'installation, de la base, du dashboard et de l'API dans ce guide.
-
-## 10. Dépannage
-
-### Modèle introuvable
-
-Vérifier que `models/lightgbm_model.txt` existe et lancer `uvicorn` depuis la racine du projet.
-
-### Base SQLite introuvable ou vide
-
-Exécuter `python .\app\build_database.py`, puis contrôler le résultat avec `python .\app\check_db.py`.
-
-### Erreur `422` sur `/predict`
-
-Le payload ne contient pas toutes les colonnes attendues ou contient une colonne inconnue. Utiliser les noms exacts des features du modèle et fournir une valeur numérique pour chacune.
-
-### Port déjà utilisé
-
-Lancer FastAPI sur un autre port :
-
-```powershell
-uvicorn app.main:app --reload --port 8001
+python -m pytest tests\test_api.py tests\test_prediction_logic.py tests\test_streamlit.py
 ```
 
 ## Assistant RAG Mistral
@@ -294,12 +208,12 @@ Le script calcule `faithfulness`, `answer_relevancy`, `context_precision` et `co
 ┌──────────────────────────────────────────────────────────┐
 │              FastAPI (main.py) - Back                    │
 │  - Reçoit les données                                    │
-│  - Exécute le modèle LightGBM chargé au démarrage       │
+│  - Exécute le modèle Forest Random chargé au démarrage       │
 │  - Renvoie probabilité + décision                        │
 └──────────────────────────┬───────────────────────────────┘
                            │
                            │ Réponse HTTP (JSON)
-                           │ ex: {"probability": 0.15, "decision": "REFUSED"}
+                           │ ex: {"probability": 0.15}
                            ▼
 ┌──────────────────────────────────────────────────────────┐
 │              Streamlit (app_2.py) - Front                │

@@ -1,105 +1,123 @@
 import sqlite3
 from pathlib import Path
-import pandas as pd
+
 import pytest
 
 
-def get_database_path():
-    for path in (
-        Path("data/processed/credit_risk.db"),
-        Path("data/proceed/credit_risk.db"),
-    ):
-        if path.exists():
-            return path
-    return None
+DATABASE_PATH = Path(__file__).resolve().parents[1] / "agritech.db"
+
+REQUIRED_TABLE_COLUMNS = {
+    "parcel_conditions": {
+        "parcel_id",
+        "country",
+        "year",
+        "rainfall_mm",
+        "avg_temp_c",
+        "pesticides_tonnes",
+        "created_at",
+    },
+    "crop_yield_history": {
+        "country",
+        "year",
+        "crop",
+        "yield_t_ha",
+    },
+    "crop_reference": {"crop"},
+    "yield_predictions": {
+        "prediction_id",
+        "parcel_id",
+        "crop",
+        "predicted_yield_t_ha",
+        "model_version",
+        "predicted_at",
+    },
+    "crop_recommendations": {
+        "recommendation_id",
+        "parcel_id",
+        "crop",
+        "predicted_yield_t_ha",
+        "rank",
+        "recommended",
+        "created_at",
+    },
+    "model_metadata": {
+        "model_name",
+        "model_version",
+        "target",
+        "rmse",
+        "mae",
+        "r2",
+    },
+    "feature_importance": {"feature", "importance"},
+}
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def db_connection():
-    path = get_database_path()
-    if path is None:
-        pytest.skip("credit_risk.db introuvable")
+    if not DATABASE_PATH.is_file():
+        pytest.fail(f"Base Agritech introuvable : {DATABASE_PATH}")
 
-    conn = sqlite3.connect(path)
-
+    conn = sqlite3.connect(DATABASE_PATH)
     try:
         yield conn
     finally:
         conn.close()
 
 
-def table_exists(conn, name):
-    return conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
-    ).fetchone()
+def table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
 
 
-def get_table_columns(conn, name):
+def get_table_columns(conn: sqlite3.Connection, name: str) -> set[str]:
     return {row[1] for row in conn.execute(f'PRAGMA table_info("{name}")')}
 
 
-def test_predictions_table_exists(db_connection):
-    assert table_exists(db_connection, "predictions") is not None
-
-
-def test_client_features_table_exists(db_connection):
-    assert table_exists(db_connection, "client_features") is not None
-
-
-def test_feature_importance_table_exists(db_connection):
-    assert table_exists(db_connection, "feature_importance") is not None
-
-
-def test_predictions_has_required_columns(db_connection):
-    assert {"SK_ID_CURR", "TARGET", "DECISION"} <= get_table_columns(
-        db_connection, "predictions"
+@pytest.mark.parametrize("table_name", REQUIRED_TABLE_COLUMNS)
+def test_agritech_tables_exist(db_connection: sqlite3.Connection, table_name: str):
+    assert table_exists(db_connection, table_name), (
+        f"La table {table_name!r} est absente de {DATABASE_PATH.name}"
     )
 
 
-def test_client_features_has_sk_id_curr(db_connection):
-    assert "SK_ID_CURR" in get_table_columns(db_connection, "client_features")
-
-
-def test_feature_importance_has_required_columns(db_connection):
-    assert {"feature", "importance"} <= get_table_columns(
-        db_connection, "feature_importance"
+@pytest.mark.parametrize(
+    ("table_name", "required_columns"),
+    REQUIRED_TABLE_COLUMNS.items(),
+)
+def test_agritech_tables_have_required_columns(
+    db_connection: sqlite3.Connection,
+    table_name: str,
+    required_columns: set[str],
+):
+    actual_columns = get_table_columns(db_connection, table_name)
+    assert required_columns <= actual_columns, (
+        f"Colonnes manquantes dans {table_name!r} : "
+        f"{sorted(required_columns - actual_columns)}"
     )
 
 
-# ============================================================
-# AFFICHAGE TEMPORAIRE POUR CAPTURE D'ÉCRAN
-# ============================================================
-def display_database_info():
-    path = get_database_path()
-
-    if path is None:
-        print("❌ credit_risk.db introuvable")
+def display_database_info() -> None:
+    if not DATABASE_PATH.is_file():
+        print(f"Base Agritech introuvable : {DATABASE_PATH}")
         return
 
-    conn = sqlite3.connect(path)
-
-    tables = pd.read_sql_query(
-        """
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'table'
-        ORDER BY name;
-        """,
-        conn,
-    )
-
-    print("\n===== LISTE DES TABLES =====")
-    print(tables.to_string(index=False))
-
-    for table_name in tables["name"]:
-        print("\n" + "=" * 60)
-        print(f"TABLE : {table_name}")
-        print("=" * 60)
-
-        cols_df = pd.read_sql_query(f'PRAGMA table_info("{table_name}")', conn)
-        print(cols_df[["name", "type", "notnull", "pk"]].to_string(index=False))
-
-    conn.close()
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        table_names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+        ]
+        print("\n===== TABLES AGRITECH =====")
+        for table_name in table_names:
+            print(f"\nTABLE : {table_name}")
+            for row in conn.execute(f'PRAGMA table_info("{table_name}")'):
+                print(f"  {row[1]} ({row[2]})")
 
 
 if __name__ == "__main__":

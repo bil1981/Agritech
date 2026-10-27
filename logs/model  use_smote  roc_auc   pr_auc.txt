@@ -1,0 +1,5 @@
+model  use_smote  roc_auc   pr_auc       f1       f2       f3  precision   recall
+           LightGBM (class_weight)      False 0.757096 0.241528 0.275216 0.419963 0.509241   0.174803 0.646727
+Logistic Regression (class_weight)      False 0.745432 0.220120 0.258625 0.410141 0.509672   0.160070 0.672991
+       Logistic Regression (SMOTE)       True 0.735423 0.214254 0.255810 0.401527 0.495638   0.159399 0.647372
+      Random Forest (class_weight)      False 0.731648 0.208232 0.090546 0.062147 0.056265   0.379982 0.051400

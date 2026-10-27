@@ -1,0 +1,29 @@
+{
+  "best_model": "random_forest",
+  "best_params": {
+    "model__max_depth": null,
+    "model__min_samples_leaf": 1,
+    "model__n_estimators": 400
+  },
+  "test_metrics": {
+    "rmse": 1.5209475408226063,
+    "mae": 0.761854890041889,
+    "r2": 0.961978098360976,
+    "mape_pct": 15.504729150215049
+  },
+  "features": [
+    "country",
+    "year",
+    "crop",
+    "rainfall_mm",
+    "avg_temp_c",
+    "pesticides_tonnes",
+    "crop_irrigation_rate",
+    "crop_fertilizer_rate",
+    "crop_mean_days_to_harvest",
+    "crop_mean_rainfall_local_mm",
+    "crop_mean_temperature_local_c",
+    "has_agronomic_proxy"
+  ],
+  "target": "yield_t_ha"
+}

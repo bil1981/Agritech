@@ -50,3 +50,11 @@ P10_DSML/
 #ignorer les fichiers src et .parquet générés par le code source, ainsi que les fichiers de cache et de configuration de l'environnement de développement.
 #Ne commite jamais les fichiers de l'environnement virtuel (.venv). Cela alourdit le dépôt, ralentit Git, et rend le projet incompatible d'une machine à une autre. Seul le fichier requirements.txt doit être versionné pour décrire les dépendances.
 #----------------------------------------------------
+
+Agritech/
+
+# Modèles et artefacts ML
+*.joblib
+models/
+notebooks/models/
+logs/

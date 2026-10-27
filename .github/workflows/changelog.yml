@@ -1,0 +1,39 @@
+name: Generate Changelog
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate CHANGELOG.md
+        uses: stefanzweifel/git-auto-commit-action@v5
+        id: auto_commit
+        with:
+          commit_message: "docs: update CHANGELOG.md for ${{ github.ref_name }} [skip ci]"
+          file_pattern: "CHANGELOG.md"
+
+      - name: Update Changelog File
+        uses: orhun/git-cliff-action@v3
+        with:
+          config: cliff.toml
+          args: --verbose
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Commit CHANGELOG.md
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "docs: update CHANGELOG.md [skip ci]"
+          file_pattern: "CHANGELOG.md"

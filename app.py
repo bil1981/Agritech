@@ -1,291 +1,398 @@
 import os
 import sqlite3
-import requests
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
+import plotly.express as px
+import requests
 import streamlit as st
 
-st.set_page_config(page_title="Dashboard Risque Crédit", layout="wide")
 
-DECISION_THRESHOLD = 0.30
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATABASE_PATH = Path(
+    os.getenv("AGRITECH_DB_PATH", str(PROJECT_ROOT / "agritech.db"))
+).resolve()
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000").rstrip("/")
+AGRONOMIC_FEATURES = (
+    "crop_irrigation_rate",
+    "crop_fertilizer_rate",
+    "crop_mean_days_to_harvest",
+    "crop_mean_rainfall_local_mm",
+    "crop_mean_temperature_local_c",
+    "has_agronomic_proxy",
+)
+MODEL_FEATURES = {
+    "country",
+    "year",
+    "crop",
+    "rainfall_mm",
+    "avg_temp_c",
+    "pesticides_tonnes",
+    *AGRONOMIC_FEATURES,
+}
 
-
-@st.cache_resource
-def get_db_connection():
-    return sqlite3.connect("data/proceed/credit_risk.db", check_same_thread=False)
-
-
-conn = get_db_connection()
-
-st.title("📊 Dashboard Risque Crédit & Explicabilité LightGBM")
-
-# Configuration des onglets
-tab1, tab2, tab3 = st.tabs(
-    [
-        "🔍 Score Client Individuel",
-        "✏️ Édition & Prédiction Dynamic",
-        "📈 Feature Importance Globale",
-    ]
+st.set_page_config(
+    page_title="Agritech Answers | Rendement agricole",
+    page_icon="🌱",
+    layout="wide",
 )
 
 
-# --- RECUPERATION DE LA LISTE DES CLIENTS ---
-@st.cache_data
-def get_client_list():
-    df_ids = pd.read_sql_query(
-        "SELECT DISTINCT SK_ID_CURR FROM predictions ORDER BY SK_ID_CURR", conn
-    )
-    return df_ids["SK_ID_CURR"].tolist()
-
-
-client_list = get_client_list()
-
-
-# --- TAB 1 : SCORE CLIENT (LISTE DÉROULANTE) ---
-with tab1:
-    st.header("Analyse d'une demande de crédit")
-
-    # Remplacement du number_input (+/-) par une Selectbox (liste déroulante)
-    sk_id = st.selectbox("Saisir / Sélectionner SK_ID_CURR :", client_list)
-
-    if st.button("Évaluer le client"):
-        query = f"SELECT * FROM predictions WHERE SK_ID_CURR = {sk_id}"
-        client_data = pd.read_sql_query(query, conn)
-
-        if not client_data.empty:
-            prob = client_data["TARGET"].iloc[0]
-            decision = client_data["DECISION"].iloc[0]
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric(
-                    label="Probabilité de Défaillance",
-                    value=f"{prob * 100:.2f} %",
-                )
-            with col2:
-                if decision == "APPROVED":
-                    st.success(f"Décision : **{decision}**")
-                else:
-                    st.error(f"Décision : **{decision}**")
-        else:
-            st.warning(f"Client {sk_id} introuvable dans la base.")
-
-
-# --- TAB 2 : ÉDITION CLIENTS & PREDICTION DYNAMIQUE ---
-with tab2:
-    st.header("Édition des données client & Simulation de Prédiction")
-
-    selected_client = st.selectbox(
-        "Sélectionner un client :", client_list, key="edit_select"
-    )
-
-    top_n_features = st.slider(
-        "Nombre de variables clés à afficher/éditer :", 5, 50, 15
-    )
-
-    if st.button("Afficher"):
-        # 1. Obtenir toutes les colonnes réellement existantes dans client_features
-        db_cols = pd.read_sql_query(
-            "SELECT * FROM client_features LIMIT 1", conn
-        ).columns.tolist()
-
-        # 2. Obtenir les top features depuis feature_importance
-        query_top_fi = f"SELECT feature FROM feature_importance ORDER BY importance DESC LIMIT {top_n_features}"
-        df_top_fi = pd.read_sql_query(query_top_fi, conn)
-        top_cols = df_top_fi["feature"].tolist()
-
-        # 3. Filtrer uniquement les colonnes FI qui existent VRAIMENT dans client_features
-        valid_cols = [c for c in top_cols if c in db_cols]
-
-        # Si aucune feature transformée n'est trouvée dans la BDD brute, prendre les N premières colonnes disponibles
-        if not valid_cols:
-            st.warning(
-                "Les features du modèle sont issues du feature engineering. Affichage des variables brutes disponibles."
-            )
-            valid_cols = [
-                c for c in db_cols if c not in ["SK_ID_CURR", "TARGET", "DECISION"]
-            ][:top_n_features]
-
-        # 4. Construire la liste finale des colonnes à charger
-        mandatory = [c for c in ["SK_ID_CURR", "TARGET", "DECISION"] if c in db_cols]
-        cols_to_select = mandatory + [c for c in valid_cols if c not in mandatory]
-
-        # Échappement des noms de colonnes avec des guillemets pour éviter tout problème de syntaxe SQL
-        cols_str = ", ".join([f'"{c}"' for c in cols_to_select])
-
-        # 5. Exécution de la requête ciblée
-        query_client = f"SELECT {cols_str} FROM client_features WHERE SK_ID_CURR = {selected_client}"
-        df_res = pd.read_sql_query(query_client, conn)
-
-        if df_res.empty:
-            st.error(f"Aucune donnée trouvée pour le client {selected_client}.")
-        else:
-            st.session_state.edited_data = df_res
-
-    # Affichage du tableau modifiable
-    if "edited_data" in st.session_state and st.session_state.edited_data is not None:
-        st.subheader(f"Valeurs pour le client {selected_client}")
-
-        edited_df = st.data_editor(
-            st.session_state.edited_data,
-            num_rows="fixed",
-            use_container_width=True,
+@st.cache_data(ttl=300)
+def load_reference_data(database_path: str) -> dict[str, Any]:
+    with sqlite3.connect(database_path) as connection:
+        countries = pd.read_sql_query(
+            """
+            SELECT DISTINCT country
+            FROM crop_yield_history
+            WHERE country IS NOT NULL AND country <> ''
+            ORDER BY country
+            """,
+            connection,
+        )["country"].tolist()
+        crops = pd.read_sql_query(
+            "SELECT * FROM crop_reference ORDER BY crop",
+            connection,
+        )
+        year_range = pd.read_sql_query(
+            "SELECT MIN(year) AS min_year, MAX(year) AS max_year FROM crop_yield_history",
+            connection,
+        ).iloc[0]
+        metadata = pd.read_sql_query(
+            "SELECT * FROM model_metadata ORDER BY id DESC LIMIT 1",
+            connection,
+        )
+        feature_importance = pd.read_sql_query(
+            "SELECT feature, importance FROM feature_importance ORDER BY importance DESC",
+            connection,
         )
 
-        st.markdown("---")
-        #### Appel à FastAPI
+    if crops.empty:
+        raise ValueError("La table crop_reference ne contient aucune culture.")
+    if not countries:
+        raise ValueError("La table crop_yield_history ne contient aucun pays.")
+    if pd.isna(year_range["min_year"]) or pd.isna(year_range["max_year"]):
+        raise ValueError("La table crop_yield_history ne contient aucune année.")
 
-        if st.button("Prédiction", key="predict_api"):
-            try:
-                # Charger toutes les variables du client
-                full_client_df = pd.read_sql_query(
-                    f"""
-                    SELECT *
-                    FROM client_features
-                    WHERE SK_ID_CURR = {int(selected_client)}
-                    """,
-                    conn,
-                )
-
-                if full_client_df.empty:
-                    st.error("Aucune donnée trouvée pour ce client.")
-                    st.stop()
-
-                # Remplacer les valeurs visibles par les valeurs modifiées
-                for column in edited_df.columns:
-                    if column in full_client_df.columns:
-                        full_client_df.loc[0, column] = edited_df.loc[0, column]
-
-                # Retirer les colonnes non utilisées comme variables
-                features_df = full_client_df.drop(
-                    columns=["SK_ID_CURR", "TARGET", "DECISION"],
-                    errors="ignore",
-                )
-
-                # Conversion des NaN en None sans convertir les catégories en nombres
-                features_dict = features_df.iloc[0].replace({np.nan: None}).to_dict()
-
-                payload = {
-                    "SK_ID_CURR": int(selected_client),
-                    "features": features_dict,
-                }
-
-                API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
-
-                response = requests.post(
-                    f"{API_URL}/predict",
-                    json=payload,
-                    timeout=30,
-                )
-
-                if response.ok:
-                    result = response.json()
-                    score_pred = float(result["probability"])
-                    decision_sim = result["decision"]
-
-                    st.subheader("Résultat de la prédiction")
-                    score_percent = score_pred * 100
-                    gauge_fig = go.Figure(
-                        go.Indicator(
-                            mode="gauge+number",
-                            value=score_percent,
-                            number={"suffix": "%", "valueformat": ".2f"},
-                            title={"text": "Probabilité de défaillance"},
-                            gauge={
-                                "axis": {
-                                    "range": [0, 100],
-                                    "tickmode": "array",
-                                    "tickvals": [0, DECISION_THRESHOLD * 100, 100],
-                                    "ticktext": ["0 %", "30 %", "100 %"],
-                                },
-                                "steps": [
-                                    {
-                                        "range": [0, DECISION_THRESHOLD * 100],
-                                        "color": "#d9eee7",
-                                    },
-                                    {
-                                        "range": [DECISION_THRESHOLD * 100, 100],
-                                        "color": "#f7dfdc",
-                                    },
-                                ],
-                                "bar": {
-                                    "color": "#d95d39"
-                                    if score_pred >= DECISION_THRESHOLD
-                                    else "#258f73"
-                                },
-                                "threshold": {
-                                    "line": {"color": "#252525", "width": 4},
-                                    "thickness": 0.8,
-                                    "value": DECISION_THRESHOLD * 100,
-                                },
-                            },
-                        )
-                    )
-                    gauge_fig.update_layout(height=280, margin={"t": 50, "b": 20})
-                    st.plotly_chart(
-                        gauge_fig,
-                        use_container_width=True,
-                        key="prediction_gauge",
-                    )
-
-                    if decision_sim == "APPROVED":
-                        st.success(f"Décision : **{decision_sim}**")
-                    else:
-                        st.error(f"Décision : **{decision_sim}**")
-                else:
-                    st.error(
-                        f"Erreur FastAPI ({response.status_code}) : {response.text}"
-                    )
-
-            except requests.exceptions.ConnectionError:
-                st.error(
-                    "FastAPI est inaccessible. Lancez : "
-                    "`python -m uvicorn app.main:app --reload`"
-                )
-            except Exception as error:
-                st.error(f"Erreur lors de la prédiction : {error}")
+    return {
+        "countries": countries,
+        "crops": crops,
+        "min_year": int(year_range["min_year"]),
+        "max_year": int(year_range["max_year"]),
+        "metadata": metadata.iloc[0].to_dict() if not metadata.empty else None,
+        "feature_importance": feature_importance,
+    }
 
 
-####
+def build_conditions(
+    country: str,
+    year: int,
+    rainfall_mm: float,
+    avg_temp_c: float,
+    pesticides_tonnes: float,
+) -> dict[str, Any]:
+    return {
+        "country": country,
+        "year": year,
+        "rainfall_mm": rainfall_mm,
+        "avg_temp_c": avg_temp_c,
+        "pesticides_tonnes": pesticides_tonnes,
+    }
 
-# --- TAB 3 : FEATURE IMPORTANCE  ---
-with tab3:
-    st.header("Facteurs d'influence du modèle")
 
-    top_n = st.slider("Nombre de variables à afficher :", 5, 50, 20)
+def request_api(endpoint: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        response = requests.post(
+            f"{API_URL}/{endpoint}",
+            json=payload,
+            timeout=30,
+        )
+    except requests.exceptions.RequestException as error:
+        st.error(
+            f"API Agritech inaccessible ({API_URL}) : {error}. "
+            "Démarrez-la avec `python -m uvicorn src.api:app --reload`."
+        )
+        return None
 
     try:
-        query_fi = (
-            f"SELECT * FROM feature_importance ORDER BY importance DESC LIMIT {top_n}"
+        result = response.json()
+    except requests.exceptions.JSONDecodeError:
+        st.error(
+            f"Réponse invalide de l'API (HTTP {response.status_code}) : "
+            f"{response.text[:500]}"
         )
-        df_fi = pd.read_sql_query(query_fi, conn)
+        return None
 
-        if not df_fi.empty:
-            fig = px.bar(
-                df_fi,
-                x="importance",
-                y="feature",
-                orientation="h",
-                title=f"Top {top_n} des variables les plus importantes",
-                labels={
-                    "importance": "Score d'importance",
-                    "feature": "Variable",
-                },
-                color="importance",
-                color_continuous_scale="Viridis",
-            )
-            fig.update_layout(
-                yaxis={"categoryorder": "total ascending"}, height=15 * top_n
-            )
+    if not response.ok:
+        detail = result.get("detail", result) if isinstance(result, dict) else result
+        st.error(f"Erreur API (HTTP {response.status_code}) : {detail}")
+        return None
+    if not isinstance(result, dict):
+        st.error("L'API a retourné une réponse au format inattendu.")
+        return None
+    return result
 
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                st.plotly_chart(fig, use_container_width=True)
-            with c2:
-                st.dataframe(df_fi, hide_index=True)
-        else:
-            st.info("Aucune donnée trouvée dans la table feature_importance.")
-    except Exception as e:
-        st.error(f"Erreur de lecture SQLite : {e}")
+
+try:
+    if not DATABASE_PATH.is_file():
+        raise FileNotFoundError(
+            f"Base Agritech introuvable : {DATABASE_PATH}. "
+            "Créez-la depuis la racine du projet avec "
+            "`python .\\src\\build_agritech_database.py`."
+        )
+    reference_data = load_reference_data(str(DATABASE_PATH))
+except (sqlite3.Error, OSError, ValueError) as error:
+    st.error(f"Impossible de charger la base Agritech : {error}")
+    st.stop()
+
+st.title("🌱 Agritech Answers")
+st.caption(
+    "Estimez le rendement d'une culture ou comparez les cultures adaptées "
+    "aux conditions de votre parcelle."
+)
+
+with st.sidebar:
+    st.header("Conditions de la parcelle")
+    st.caption("Ces conditions sont partagées par la prédiction et la recommandation.")
+
+    selected_country = st.selectbox(
+        "Pays",
+        reference_data["countries"],
+        index=(
+            reference_data["countries"].index("France")
+            if "France" in reference_data["countries"]
+            else 0
+        ),
+    )
+    selected_year = st.number_input(
+        "Année",
+        min_value=reference_data["min_year"],
+        max_value=reference_data["max_year"],
+        value=min(2013, reference_data["max_year"]),
+        step=1,
+        help=(
+            "La plage disponible provient de l'historique de la base "
+            f"({reference_data['min_year']}–{reference_data['max_year']})."
+        ),
+    )
+    rainfall_mm = st.number_input(
+        "Précipitations (mm)",
+        min_value=0.0,
+        value=800.0,
+        step=25.0,
+    )
+    avg_temp_c = st.number_input(
+        "Température moyenne (°C)",
+        min_value=-20.0,
+        max_value=60.0,
+        value=15.0,
+        step=0.5,
+    )
+    pesticides_tonnes = st.number_input(
+        "Pesticides utilisés (tonnes)",
+        min_value=0.0,
+        value=1000.0,
+        step=100.0,
+    )
+    st.divider()
+    st.caption(f"Base utilisée : `{DATABASE_PATH.name}`")
+    st.caption(f"API : `{API_URL}`")
+
+parcel_conditions = build_conditions(
+    selected_country,
+    int(selected_year),
+    rainfall_mm,
+    avg_temp_c,
+    pesticides_tonnes,
+)
+
+prediction_tab, recommendation_tab, model_tab = st.tabs(
+    ["Prédire un rendement", "Recommander une culture", "Données & modèle"]
+)
+
+with prediction_tab:
+    st.subheader("Estimation pour une culture")
+    st.write(
+        "Choisissez une culture et obtenez son rendement estimé en tonnes par hectare."
+    )
+
+    crop_reference = reference_data["crops"]
+    crop_names = crop_reference["crop"].dropna().astype(str).tolist()
+    selected_crop = st.selectbox("Culture", crop_names, key="prediction_crop")
+
+    if st.button("Estimer le rendement", type="primary", key="predict_yield"):
+        crop_row = crop_reference.loc[crop_reference["crop"] == selected_crop].iloc[0]
+        features = dict(parcel_conditions)
+        features["crop"] = selected_crop
+
+        with st.spinner("Calcul du rendement..."):
+            result = request_api("predict", {"features": features})
+        if result is not None:
+            estimate = result.get("estimated_yield_t_ha")
+            if not isinstance(estimate, (int, float)):
+                st.error("La réponse de l'API ne contient pas de rendement valide.")
+            else:
+                left, right = st.columns([1, 2])
+                with left:
+                    st.metric("Rendement estimé", f"{estimate:.2f} t/ha")
+                    if crop_row.get("has_agronomic_proxy", 0):
+                        st.caption(
+                            "Les informations agronomiques de la culture "
+                            "proviennent du référentiel SQLite."
+                        )
+                    else:
+                        st.info(
+                            "Le référentiel ne contient pas de proxy agronomique "
+                            "pour cette culture ; le modèle complète les valeurs "
+                            "manquantes avec son prétraitement."
+                        )
+                with right:
+                    st.dataframe(
+                        pd.DataFrame(
+                            {
+                                "Condition": [
+                                    "Pays",
+                                    "Année",
+                                    "Précipitations",
+                                    "Température moyenne",
+                                    "Pesticides utilisés",
+                                ],
+                                "Valeur": [
+                                    selected_country,
+                                    str(int(selected_year)),
+                                    f"{rainfall_mm:g} mm",
+                                    f"{avg_temp_c:g} °C",
+                                    f"{pesticides_tonnes:g} tonnes",
+                                ],
+                            }
+                        ),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+with recommendation_tab:
+    st.subheader("Classement des cultures")
+    st.write(
+        "Le modèle simule le rendement de toutes les cultures du référentiel "
+        "pour les conditions sélectionnées."
+    )
+
+    if st.button(
+        "Comparer les cultures",
+        type="primary",
+        key="recommend_crops",
+    ):
+        with st.spinner("Comparaison des cultures..."):
+            result = request_api("recommend", {"features": parcel_conditions})
+
+        if result is not None:
+            recommendations = result.get("recommendations")
+            if not isinstance(recommendations, list) or not recommendations:
+                st.error("L'API n'a retourné aucune recommandation.")
+            else:
+                ranking = pd.DataFrame(recommendations)
+                required_columns = {
+                    "rank",
+                    "crop",
+                    "estimated_yield_t_ha",
+                }
+                if not required_columns.issubset(ranking.columns):
+                    st.error("Le format du classement retourné par l'API est invalide.")
+                else:
+                    ranking = ranking.sort_values("rank")
+                    top_crop = ranking.iloc[0]
+                    st.success(
+                        f"Culture la mieux classée : **{top_crop['crop']}** "
+                        f"— {top_crop['estimated_yield_t_ha']:.2f} t/ha estimées."
+                    )
+                    chart_data = ranking.sort_values(
+                        "estimated_yield_t_ha",
+                        ascending=True,
+                    )
+                    figure = px.bar(
+                        chart_data,
+                        x="estimated_yield_t_ha",
+                        y="crop",
+                        orientation="h",
+                        labels={
+                            "estimated_yield_t_ha": "Rendement estimé (t/ha)",
+                            "crop": "Culture",
+                        },
+                        text_auto=".2f",
+                        color="estimated_yield_t_ha",
+                        color_continuous_scale="Greens",
+                    )
+                    figure.update_layout(
+                        coloraxis_showscale=False,
+                        yaxis={
+                            "categoryorder": "array",
+                            "categoryarray": chart_data["crop"],
+                        },
+                        margin={"l": 10, "r": 10, "t": 20, "b": 10},
+                    )
+                    st.plotly_chart(figure, use_container_width=True)
+                    st.dataframe(
+                        ranking.rename(
+                            columns={
+                                "rank": "Rang",
+                                "crop": "Culture",
+                                "estimated_yield_t_ha": "Rendement estimé (t/ha)",
+                            }
+                        ),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+
+with model_tab:
+    st.subheader("Référentiel Agritech")
+    st.write(
+        f"La base `{DATABASE_PATH.name}` fournit les cultures, les pays, "
+        "les plages historiques et les indicateurs du modèle."
+    )
+
+    metadata = reference_data["metadata"]
+    if metadata is None:
+        st.warning("Aucune métadonnée de modèle n'est enregistrée dans la base.")
+    else:
+        st.markdown(
+            f"**Modèle :** {metadata.get('model_name') or 'Non renseigné'}  \n"
+            f"**Version :** {metadata.get('model_version') or 'Non renseignée'}  \n"
+            f"**Cible :** {metadata.get('target') or 'Non renseignée'}"
+        )
+        metric_columns = st.columns(4)
+        for column, label, key, suffix in zip(
+            metric_columns,
+            ("RMSE", "MAE", "R²", "MAPE"),
+            ("rmse", "mae", "r2", "mape_pct"),
+            (" t/ha", " t/ha", "", " %"),
+        ):
+            value = metadata.get(key)
+            column.metric(label, f"{value:.3f}{suffix}" if value is not None else "N/D")
+
+    importance = reference_data["feature_importance"]
+    relevant_importance = importance.loc[
+        importance["feature"].isin(MODEL_FEATURES)
+    ].head(15)
+    if not relevant_importance.empty:
+        st.subheader("Variables importantes du modèle")
+        figure = px.bar(
+            relevant_importance.sort_values("importance"),
+            x="importance",
+            y="feature",
+            orientation="h",
+            labels={"importance": "Importance", "feature": "Variable"},
+        )
+        st.plotly_chart(figure, use_container_width=True)
+    elif not importance.empty:
+        st.info(
+            "La table d'importance présente dans la base ne correspond pas "
+            "aux variables du modèle de rendement ; elle n'est pas affichée."
+        )
+
+    st.subheader("Cultures disponibles")
+    st.dataframe(
+        reference_data["crops"].drop(columns=["crop_id"], errors="ignore"),
+        hide_index=True,
+        use_container_width=True,
+    )
